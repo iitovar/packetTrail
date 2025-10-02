@@ -1,0 +1,28 @@
+{% extends "layout.html" %}
+{% block content %}
+<h1 class="h5 mb-3">Packets</h1>
+<div class="table-responsive">
+<table class="table table-sm table-striped">
+  <thead>
+    <tr><th>Time (UTC)</th><th>Src</th><th>Dst</th><th>Proto</th><th>S</th><th>D</th><th>Len</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.ts_iso }}</td>
+      <td>{{ r.src_ip }}</td>
+      <td>{{ r.dst_ip }}</td>
+      <td>{{ r.proto }}</td>
+      <td>{{ r.sport }}</td>
+      <td>{{ r.dport }}</td>
+      <td>{{ r.length }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+<p>Showing {{ rows|length }} of {{ count }} — page {{ page }}</p>
+<a class="btn btn-outline-secondary btn-sm" href="?page={{ page-1 if page>1 else 1 }}&size={{ size }}">Prev</a>
+<a class="btn btn-outline-secondary btn-sm" href="?page={{ page+1 }}&size={{ size }}">Next</a>
+{% endblock %}
+
