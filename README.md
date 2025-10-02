@@ -13,17 +13,6 @@ PacketTrail is a lightweight network intrusion detection and forensics tool deve
 - **Flask Dashboard:** Web interface with tables of recent alerts and captured packets.  
 - **CSV Export:** Utility to export packets and alerts to CSV for offline analysis.  
 
-## Screenshots
-
-### Beaconing Alert (CLI)
-![Beaconing alert](docs/screenshots/beaconing.png)
-
-### Alerts Dashboard
-![Alerts table](docs/screenshots/alerts.png)
-
-### Packets Dashboard
-![Packets table](docs/screenshots/packets.png)
-
 ## Installation
 
 Clone the repository and set up a virtual environment:
