@@ -1,0 +1,130 @@
+{% extends "layout.html" %}
+{% block content %}
+
+<div class="row g-3 mb-3">
+  <div class="col-12">
+    <div class="card shadow-sm pt-card">
+      <div class="card-body d-flex flex-wrap justify-content-between align-items-center">
+        <div>
+          <h1 class="h4 mb-1 text-white">Network Overview</h1>
+          <div class="text-white-50">Window: <code id="win-start">{{ start_iso }}</code> → <code id="win-end">{{ end_iso }}</code></div>
+        </div>
+        <div class="d-flex gap-3 mt-3 mt-md-0">
+          <div class="pt-metric bg-blue text-white">
+            <div class="label">Good Traffic</div>
+            <div class="value" id="metric-good">{{ good_packets }}</div>
+          </div>
+          <div class="pt-metric bg-red text-white">
+            <div class="label">Pending Warnings</div>
+            <div class="value" id="metric-alerts">{{ total_alerts }}</div>
+          </div>
+          <div class="pt-metric bg-dark text-white">
+            <div class="label">Flagged Hosts</div>
+            <div class="value" id="metric-hosts">{{ hosts_flagged }}</div>
+          </div>
+          <div class="pt-metric bg-secondary text-white">
+            <div class="label">Packets Seen</div>
+            <div class="value" id="metric-total">{{ total_packets }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-7">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Traffic Volume (packets / minute)</h2>
+        <canvas id="pktsChart"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Alert Frequency (by type)</h2>
+        <canvas id="alertsChart"></canvas>
+      </div>
+    </div>
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Protocol Breakdown</h2>
+        <canvas id="protoChart"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+let pktChart, alertChart, protoChart;
+
+// initial data from server render
+const initPktLabels = {{ packet_labels|tojson }};
+const initPktCounts = {{ packet_counts|tojson }};
+const initAlertTypes = {{ alert_types|tojson }};
+const initAlertValues = {{ alert_values|tojson }};
+const initProtoLabels = {{ proto_labels|tojson }};
+const initProtoValues = {{ proto_values|tojson }};
+
+function buildCharts() {
+  const pktCtx = document.getElementById('pktsChart');
+  const alertsCtx = document.getElementById('alertsChart');
+  const protoCtx = document.getElementById('protoChart');
+
+  pktChart = new Chart(pktCtx, {
+    type: 'line',
+    data: { labels: initPktLabels, datasets: [{ label: 'Packets/min', data: initPktCounts, tension: 0.2 }]},
+    options: { plugins:{legend:{display:false}}, scales: { x: { ticks: { maxTicksLimit: 8 }}}}
+  });
+
+  alertChart = new Chart(alertsCtx, {
+    type: 'bar',
+    data: { labels: initAlertTypes, datasets: [{ label: 'Alerts', data: initAlertValues }]},
+    options: { plugins: { legend: { display: false }}}
+  });
+
+  protoChart = new Chart(protoCtx, {
+    type: 'doughnut',
+    data: { labels: initProtoLabels, datasets: [{ data: initProtoValues }]},
+    options: { plugins: { legend: { position: 'bottom' }}}
+  });
+}
+
+async function refreshOverview() {
+  try {
+    const res = await fetch('/api/overview');
+    const j = await res.json();
+
+    // metrics
+    document.getElementById('metric-good').textContent = j.good_packets;
+    document.getElementById('metric-alerts').textContent = j.total_alerts;
+    document.getElementById('metric-hosts').textContent = j.hosts_flagged;
+    document.getElementById('metric-total').textContent = j.total_packets;
+    document.getElementById('win-start').textContent = j.start_iso;
+    document.getElementById('win-end').textContent = j.end_iso;
+
+    // charts
+    pktChart.data.labels = j.packet_labels;
+    pktChart.data.datasets[0].data = j.packet_counts;
+    pktChart.update('none');
+
+    alertChart.data.labels = j.alert_types;
+    alertChart.data.datasets[0].data = j.alert_values;
+    alertChart.update('none');
+
+    protoChart.data.labels = j.proto_labels;
+    protoChart.data.datasets[0].data = j.proto_values;
+    protoChart.update('none');
+  } catch (e) {
+    // ignore transient errors during demo
+  }
+}
+
+buildCharts();
+setInterval(refreshOverview, 10000); // refresh every 10 seconds
+</script>
+{% endblock %}
+

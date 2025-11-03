@@ -1,0 +1,63 @@
+{% extends "layout.html" %}
+{% block content %}
+<h1 class="h5 mb-3 text-white">Packets</h1>
+
+<form class="row gy-2 gx-2 align-items-end mb-3" method="get">
+  <div class="col-md-3">
+    <label class="form-label text-white-50">Src contains</label>
+    <input name="qsrc" class="form-control" value="{{ qsrc or '' }}" placeholder="e.g., 192.168.1.77">
+  </div>
+  <div class="col-md-3">
+    <label class="form-label text-white-50">Dst contains</label>
+    <input name="qdst" class="form-control" value="{{ qdst or '' }}" placeholder="e.g., 224.0.0.251">
+  </div>
+  <div class="col-md-2">
+    <label class="form-label text-white-50">Protocol</label>
+    <select name="proto" class="form-select">
+      <option value=""  {{ ''  == proto and 'selected' or '' }}>Any</option>
+      <option value="TCP" {{ 'TCP' == proto and 'selected' or '' }}>TCP</option>
+      <option value="UDP" {{ 'UDP' == proto and 'selected' or '' }}>UDP</option>
+    </select>
+  </div>
+  <div class="col-md-2">
+    <label class="form-label text-white-50">Start (UTC date)</label>
+    <input name="start" type="date" class="form-control" value="{{ start_val }}">
+  </div>
+  <div class="col-md-2">
+    <label class="form-label text-white-50">End (UTC date)</label>
+    <input name="end" type="date" class="form-control" value="{{ end_val }}">
+  </div>
+  <div class="col-12 col-md-2">
+    <label class="form-label d-block text-white-50">&nbsp;</label>
+    <button class="btn btn-primary w-100" type="submit">Apply</button>
+  </div>
+</form>
+
+<div class="card shadow-sm">
+<div class="table-responsive">
+<table class="table table-sm table-striped mb-0">
+  <thead>
+    <tr><th>Time (UTC)</th><th>Src</th><th>Dst</th><th>Proto</th><th>S</th><th>D</th><th>Len</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.ts_iso }}</td>
+      <td>{{ r.src_ip }}</td>
+      <td>{{ r.dst_ip }}</td>
+      <td>{{ r.proto }}</td>
+      <td>{{ r.sport }}</td>
+      <td>{{ r.dport }}</td>
+      <td>{{ r.length }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+</div>
+
+<p class="mt-2 text-white-50">Showing {{ rows|length }} of {{ count }} — page {{ page }}</p>
+<a class="btn btn-outline-light btn-sm" href="?page={{ page-1 if page>1 else 1 }}&size={{ size }}&qsrc={{ qsrc }}&qdst={{ qdst }}&proto={{ proto }}&start={{ start_val }}&end={{ end_val }}">Prev</a>
+<a class="btn btn-outline-light btn-sm" href="?page={{ page+1 }}&size={{ size }}&qsrc={{ qsrc }}&qdst={{ qdst }}&proto={{ proto }}&start={{ start_val }}&end={{ end_val }}">Next</a>
+{% endblock %}
+
