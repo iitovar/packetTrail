@@ -28,7 +28,7 @@ def parse_dt_local(s: Optional[str]) -> Optional[datetime]:
     s = s.strip()
     if not DATE_RE.match(s):
         return None
-    # interpret as UTC for simplicity (your capture is stored in UTC)
+    # interpret as UTC 
     return datetime.strptime(s, "%Y-%m-%dT%H:%M").replace(tzinfo=UTC)
 
 def parse_iso_z(s: Optional[str]) -> Optional[datetime]:
