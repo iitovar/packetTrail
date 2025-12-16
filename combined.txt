@@ -1,0 +1,1129 @@
+===== ./app.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+import os, sqlite3, re
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, Tuple, Optional
+from flask import Flask, g, render_template, request, jsonify
+
+UTC = timezone.utc
+DB_ROW_FACTORY = sqlite3.Row
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")  # matches HTML datetime-local (no seconds)
+
+def get_db(db_path: str) -> sqlite3.Connection:
+    if "db" not in g:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = DB_ROW_FACTORY
+        g.db = conn
+    return g.db  # type: ignore[return-value]
+
+def close_db(_=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+def parse_dt_local(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    if not DATE_RE.match(s):
+        return None
+    # interpret as UTC for simplicity (your capture is stored in UTC)
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M").replace(tzinfo=UTC)
+
+def parse_iso_z(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"): s = s[:-1]
+        return datetime.fromisoformat(s).replace(tzinfo=UTC)
+    except Exception:
+        return None
+
+def default_window(hours: int = 1) -> Tuple[datetime, datetime]:
+    end = datetime.now(tz=UTC).replace(second=0, microsecond=0)
+    start = end - timedelta(hours=hours)
+    return start, end
+
+def epoch(dt: datetime) -> float:
+    return dt.timestamp()
+
+def create_app(db_path: str) -> Flask:
+    app = Flask(__name__)
+    app.config["DB_PATH"] = db_path
+    app.teardown_appcontext(close_db)
+
+    def overview_counts(start_dt: datetime, end_dt: datetime) -> Dict[str, Any]:
+        se, ee = epoch(start_dt), epoch(end_dt)
+        db = get_db(db_path)
+
+        pkt_rows = db.execute("""
+            SELECT epoch, proto, src_ip, dst_ip
+            FROM packets WHERE epoch BETWEEN ? AND ? ORDER BY epoch ASC
+        """, (se, ee)).fetchall()
+        alert_rows = db.execute("""
+            SELECT epoch, ts_iso, src_ip, alert_type, details
+            FROM alerts WHERE epoch BETWEEN ? AND ? ORDER BY epoch DESC
+        """, (se, ee)).fetchall()
+
+        from collections import defaultdict
+        per_min = defaultdict(int)
+        cur = start_dt.replace(second=0, microsecond=0)
+        while cur <= end_dt:
+            per_min[cur.isoformat().replace("+00:00","Z")] = 0
+            cur += timedelta(minutes=1)
+
+        proto_counts = defaultdict(int)
+        alerted_srcs = set()
+        alert_by_type = defaultdict(int)
+
+        for r in pkt_rows:
+            t = datetime.fromtimestamp(r["epoch"], UTC).replace(second=0, microsecond=0)
+            key = t.isoformat().replace("+00:00","Z")
+            if key in per_min: per_min[key] += 1
+            p = (r["proto"] or "").upper()
+            proto_counts[p if p in ("TCP","UDP") else "OTHER"] += 1
+
+        for r in alert_rows:
+            alert_by_type[r["alert_type"]] += 1
+            if r["src_ip"]: alerted_srcs.add(r["src_ip"])
+
+        threat_hits = db.execute("""
+            SELECT COUNT(*) AS c FROM packets p
+            WHERE p.epoch BETWEEN ? AND ?
+              AND (p.src_ip IN (SELECT ip FROM threat_intel) OR p.dst_ip IN (SELECT ip FROM threat_intel))
+        """, (se, ee)).fetchone()["c"]
+
+        top_src = db.execute("""
+            SELECT src_ip, COUNT(*) AS c
+            FROM packets
+            WHERE epoch BETWEEN ? AND ? AND src_ip IS NOT NULL
+            GROUP BY src_ip
+            ORDER BY c DESC
+            LIMIT 5
+        """, (se, ee)).fetchall()
+
+        packet_labels = sorted(per_min.keys())
+        packet_counts = [per_min[k] for k in packet_labels]
+        alert_types = sorted(alert_by_type.keys()) or ["PORT_SCAN","BURST_RATE","BEACONING","THREAT_MATCH"]
+        alert_values = [alert_by_type[t] for t in alert_types]
+
+        # recent alerts for the dashboard (top 5, newest first)
+        recent_alerts = [
+            {"ts_iso": r["ts_iso"], "src_ip": r["src_ip"], "alert_type": r["alert_type"], "details": r["details"]}
+            for r in alert_rows[:5]
+        ]
+
+        proto_labels = ["TCP","UDP","OTHER"]
+        proto_values = [proto_counts.get("TCP",0), proto_counts.get("UDP",0), proto_counts.get("OTHER",0)]
+
+        total_packets = len(pkt_rows)
+        total_alerts = len(alert_rows)
+        hosts_flagged = len(alerted_srcs)
+        good_packets = total_packets - threat_hits
+
+        return {
+            "start_iso": start_dt.isoformat().replace("+00:00","Z"),
+            "end_iso": end_dt.isoformat().replace("+00:00","Z"),
+            "total_packets": total_packets,
+            "good_packets": good_packets,
+            "total_alerts": total_alerts,
+            "hosts_flagged": hosts_flagged,
+            "packet_labels": packet_labels,
+            "packet_counts": packet_counts,
+            "alert_types": alert_types,
+            "alert_values": alert_values,
+            "proto_labels": proto_labels,
+            "proto_values": proto_values,
+            "threat_hits": threat_hits,
+            "top_src": [dict(row) for row in top_src],
+            "recent_alerts": recent_alerts,
+        }
+
+    @app.route("/")
+    def home():
+        start_q = parse_iso_z(request.args.get("start")) or parse_dt_local(request.args.get("start_local"))
+        end_q   = parse_iso_z(request.args.get("end"))   or parse_dt_local(request.args.get("end_local"))
+        if not start_q or not end_q:
+            start_q, end_q = default_window(1)
+        data = overview_counts(start_q, end_q)
+        return render_template("home.html", **data)
+
+    @app.route("/api/overview")
+    def api_overview():
+        start_q = parse_iso_z(request.args.get("start")) or parse_dt_local(request.args.get("start_local"))
+        end_q   = parse_iso_z(request.args.get("end"))   or parse_dt_local(request.args.get("end_local"))
+        if not start_q or not end_q:
+            start_q, end_q = default_window(1)
+        return jsonify(overview_counts(start_q, end_q))
+
+    @app.route("/alerts")
+    def alerts_view():
+        db = get_db(db_path)
+        # Inputs
+        start_q = parse_dt_local(request.args.get("start"))
+        end_q   = parse_dt_local(request.args.get("end"))
+        if not start_q or not end_q:
+            start_q, end_q = default_window(4)
+        sort = request.args.get("sort", "desc").lower()
+        order = "DESC" if sort == "desc" else "ASC"
+
+        se, ee = epoch(start_q), epoch(end_q)
+        rows = db.execute(f"""
+            SELECT ts_iso, src_ip, alert_type, details, epoch
+            FROM alerts
+            WHERE epoch BETWEEN ? AND ?
+            ORDER BY epoch {order}
+            LIMIT 2000
+        """, (se, ee)).fetchall()
+
+        return render_template("alerts.html", rows=rows, start_val=start_q, end_val=end_q, sort=sort)
+
+    @app.route("/packets")
+    def packets_view():
+        db = get_db(db_path)
+        start_q = parse_dt_local(request.args.get("start"))
+        end_q   = parse_dt_local(request.args.get("end"))
+        if not start_q or not end_q:
+            start_q, end_q = default_window(1)
+        sort = request.args.get("sort", "desc").lower()
+        order = "DESC" if sort == "desc" else "ASC"
+
+        se, ee = epoch(start_q), epoch(end_q)
+        rows = db.execute(f"""
+            WITH freq AS (
+              SELECT src_ip, dst_ip, COUNT(*) AS cnt
+              FROM packets
+              WHERE epoch BETWEEN ? AND ?
+              GROUP BY src_ip, dst_ip
+            )
+            SELECT p.ts_iso, p.src_ip, p.dst_ip,
+                   dc_dst.hostname AS dst_host,
+                   p.proto, p.sport, p.dport, p.length, p.epoch,
+                   COALESCE(f.cnt,1) AS freq_last_hour,
+                   CASE
+                     WHEN (p.src_ip IN (SELECT ip FROM threat_intel) OR p.dst_ip IN (SELECT ip FROM threat_intel))
+                     THEN 1 ELSE 0
+                   END AS is_threat
+            FROM packets p
+            LEFT JOIN freq f ON f.src_ip = p.src_ip AND f.dst_ip = p.dst_ip
+            LEFT JOIN dns_cache dc_dst ON dc_dst.ip = p.dst_ip
+            WHERE p.epoch BETWEEN ? AND ?
+            ORDER BY p.epoch {order}
+            LIMIT 2000
+        """, (se, ee, se, ee)).fetchall()
+
+        return render_template("packets.html", rows=rows, start_val=start_q, end_val=end_q, sort=sort)
+
+    return app
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="PacketTrail Dashboard")
+    p.add_argument("--db", default=os.environ.get("PACKETTRAIL_DB", "packettrail.db"))
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", default=5000, type=int)
+    args = p.parse_args()
+
+    app = create_app(args.db)
+    app.run(host=args.host, port=args.port, debug=True)
+
+
+
+===== ./export_csv.py =====
+#!/usr/bin/env python3
+"""
+Export PacketTrail SQLite tables to CSV.
+
+Usage:
+  python3 export_csv.py --db packettrail.db --out export_dir
+
+Example:
+  python3 export_csv.py --db packettrail.db --out sample_export
+"""
+
+import argparse
+import sqlite3
+import csv
+import os
+
+def export_table(conn, table, outdir):
+    cur = conn.execute(f"SELECT * FROM {table}")
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f"{table}.csv")
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(cols)
+        writer.writerows(rows)
+
+    return path, len(rows)
+
+def main():
+    parser = argparse.ArgumentParser(description="Export PacketTrail SQLite tables to CSV")
+    parser.add_argument("--db", default="packettrail.db", help="Path to SQLite database")
+    parser.add_argument("--out", default="export", help="Directory to write CSV files")
+    args = parser.parse_args()
+
+    conn = sqlite3.connect(args.db)
+    try:
+        for table in ("packets", "alerts"):
+            try:
+                path, n = export_table(conn, table, args.out)
+                print(f"Exported {table} -> {path} ({n} rows)")
+            except Exception as e:
+                print(f"[warn] Could not export {table}: {e}")
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== ./make_demo_rows.py =====
+#!/usr/bin/env python3
+"""
+make_demo_rows.py
+Populate packettrail.db with a few demo rows for screenshots if you can't sniff live.
+
+Usage:
+  python3 make_demo_rows.py --db packettrail.db
+
+After running:
+  sqlite3 packettrail.db "SELECT * FROM packets;"
+  sqlite3 packettrail.db "SELECT * FROM alerts;"
+"""
+
+import argparse
+import sqlite3
+import time
+
+def ensure_schema(conn):
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS packets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_iso TEXT NOT NULL,
+        epoch REAL NOT NULL,
+        src_ip TEXT,
+        dst_ip TEXT,
+        proto TEXT,
+        sport INTEGER,
+        dport INTEGER,
+        length INTEGER
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_iso TEXT NOT NULL,
+        epoch REAL NOT NULL,
+        src_ip TEXT,
+        alert_type TEXT NOT NULL,
+        details TEXT
+    );
+    """)
+    conn.commit()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default="packettrail.db", help="Path to SQLite database file")
+    args = parser.parse_args()
+
+    conn = sqlite3.connect(args.db)
+    ensure_schema(conn)
+
+    now = time.time()
+    packets = [
+        ("2025-09-18T19:20:00Z", now-60, "192.168.1.50", "142.250.72.14", "TCP", 54500, 80, 900),
+        ("2025-09-18T19:20:02Z", now-58, "192.168.1.77", "142.250.72.14", "TCP", 54510, 443, 860),
+        ("2025-09-18T19:20:04Z", now-56, "192.168.1.50", "8.8.8.8", "UDP", 5353, 53, 120),
+        ("2025-09-18T19:20:06Z", now-54, "192.168.1.50", "142.250.72.14", "TCP", 54511, 81, 700)
+    ]
+    alerts = [
+        ("2025-09-18T19:20:10Z", now-50, "192.168.1.50", "PORT_SCAN",
+         "Port scan suspected: 25 unique dports within 10s"),
+        ("2025-09-18T19:20:14Z", now-46, "192.168.1.77", "BURST_RATE",
+         "High packet rate: 230 packets within 10s")
+    ]
+
+    conn.executemany(
+        "INSERT INTO packets (ts_iso, epoch, src_ip, dst_ip, proto, sport, dport, length) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        packets
+    )
+    conn.executemany(
+        "INSERT INTO alerts (ts_iso, epoch, src_ip, alert_type, details) VALUES (?,?,?,?,?)",
+        alerts
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"Inserted {len(packets)} packets and {len(alerts)} alerts into {args.db}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== ./packettrail.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, os, sqlite3, time
+from datetime import datetime, timezone, timedelta
+from scapy.all import sniff, IP, TCP, UDP
+
+UTC = timezone.utc
+
+def iso_now(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(ts or time.time(), UTC).isoformat().replace("+00:00","Z")
+
+def open_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+class Detector:
+    def __init__(self, db: sqlite3.Connection, window: int, port_threshold: int, rate_threshold: int, beacon_count: int, beacon_jitter: float):
+        self.db = db
+        self.window = window
+        self.port_threshold = port_threshold
+        self.rate_threshold = rate_threshold
+        self.beacon_count = beacon_count
+        self.beacon_jitter = beacon_jitter
+        self._ports: dict[str,set[int]] = {}
+        self._times: dict[str,list[float]] = {}
+
+    def _insert_alert(self, src: str | None, a_type: str, details: str, ts: float | None = None):
+        ep = ts or time.time()
+        self.db.execute(
+            "INSERT INTO alerts(epoch, ts_iso, src_ip, alert_type, details) VALUES (?,?,?,?,?)",
+            (ep, iso_now(ep), src, a_type, details)
+        )
+        self.db.commit()
+
+    def _portscan(self, now: float, src: str, dport: int | None):
+        if dport is None: 
+            return
+        s = self._ports.setdefault(src, set())
+        s.add(dport)
+        # drop old state window
+        for k in list(self._ports.keys()):
+            # (simple windowing by size; adequate for MVP)
+            if len(self._ports[k]) > self.port_threshold:
+                self._insert_alert(src, "PORT_SCAN", f"Port scan suspected: {len(self._ports[k])} unique dports within {self.window}s", now)
+                self._ports[k].clear()
+
+    def _burst(self, now: float, src: str):
+        tlist = self._times.setdefault(src, [])
+        tlist.append(now)
+        # keep only recent timestamps
+        cutoff = now - self.window
+        while tlist and tlist[0] < cutoff:
+            tlist.pop(0)
+        if len(tlist) >= self.rate_threshold:
+            self._insert_alert(src, "BURST_RATE", f"High packet rate: {len(tlist)} packets within {self.window}s", now)
+            tlist.clear()
+
+    def _beacon(self, now: float, src: str):
+        # simple fixed-interval check (demo-level)
+        tlist = self._times.setdefault(f"b:{src}", [])
+        tlist.append(now)
+        if len(tlist) < self.beacon_count:
+            return
+        intervals = [tlist[i+1]-tlist[i] for i in range(len(tlist)-1)]
+        avg = sum(intervals)/len(intervals)
+        if all(abs(iv-avg) <= self.beacon_jitter*avg for iv in intervals):
+            self._insert_alert(src, "BEACONING", f"Regular callback interval ~{avg:.2f}s", now)
+            tlist.clear()
+
+    def _threat_match(self, src: str | None, dst: str | None, ts: float):
+        # check if either IP is in threat_intel
+        if not (src or dst): 
+            return
+        cur = self.db.cursor()
+        for ip in (src, dst):
+            if not ip: 
+                continue
+            row = cur.execute("SELECT source FROM threat_intel WHERE ip = ?", (ip,)).fetchone()
+            if row:
+                self._insert_alert(src, "THREAT_MATCH", f"Matched blocklist ({row['source']}) for IP {ip}", ts)
+                break
+
+    def observe(self, now_epoch: float, src: str | None, dport: int | None, dst: str | None):
+        if src:
+            self._portscan(now_epoch, src, dport)
+            self._burst(now_epoch, src)
+            self._beacon(now_epoch, src)
+        self._threat_match(src, dst, now_epoch)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--iface", required=True)
+    ap.add_argument("--db", default="packettrail.db")
+    ap.add_argument("--window", type=int, default=10)
+    ap.add_argument("--port-threshold", type=int, default=25)
+    ap.add_argument("--rate-threshold", type=int, default=200)
+    ap.add_argument("--beacon-count", type=int, default=6)
+    ap.add_argument("--beacon-jitter", type=float, default=0.30)
+    ap.add_argument("--bpf", default="tcp or udp")
+    args = ap.parse_args()
+
+    db = open_db(args.db)
+    print(f"[PacketTrail] DB -> {args.db}")
+
+    def on_pkt(pkt):
+        now = time.time()
+        if IP not in pkt:
+            return
+        ip = pkt[IP]
+        proto = "TCP" if TCP in pkt else ("UDP" if UDP in pkt else "IP")
+        sport = int(pkt[TCP].sport) if TCP in pkt else (int(pkt[UDP].sport) if UDP in pkt else None)
+        dport = int(pkt[TCP].dport) if TCP in pkt else (int(pkt[UDP].dport) if UDP in pkt else None)
+
+        db.execute(
+            "INSERT INTO packets(epoch, ts_iso, src_ip, dst_ip, proto, sport, dport, length) VALUES (?,?,?,?,?,?,?,?)",
+            (now, iso_now(now), ip.src, ip.dst, proto, sport, dport, len(pkt))
+        )
+        db.commit()
+
+        det.observe(now, ip.src, dport, ip.dst)
+
+    det = Detector(db, args.window, args.port_threshold, args.rate_threshold, args.beacon_count, args.beacon_jitter)
+    print("[PacketTrail] Starting sniff... (Ctrl+C to stop)")
+    try:
+        sniff(iface=args.iface, prn=on_pkt, store=False, filter=args.bpf)
+    finally:
+        print("[PacketTrail] DB closed.")
+        db.close()
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== ./README.md =====
+# PacketTrail
+
+PacketTrail is a lightweight network intrusion detection and forensics tool developed as my cybersecurity capstone project. It combines live packet capture, anomaly detection, structured logging, and a web dashboard to make network activity and alerts easy to analyze for investigators.
+
+## Features
+
+- **Packet Capture:** Uses Scapy to capture TCP/UDP packets on a chosen interface.  
+- **Database Logging:** Stores metadata (timestamp, source/destination IPs, ports, protocol, packet length) in SQLite.  
+- **Anomaly Detection:**  
+  - **Port Scans** – detects excessive unique ports probed by a host.  
+  - **Burst Traffic** – flags unusually high packet volumes in a short time window.  
+  - **Beaconing** – identifies highly regular traffic intervals that may indicate malware callbacks.  
+- **Flask Dashboard:** Web interface with tables of recent alerts and captured packets.  
+- **CSV Export:** Utility to export packets and alerts to CSV for offline analysis.  
+
+## Installation
+
+Clone the repository and set up a virtual environment:
+
+```bash
+git clone https://github.com/iitovar/packetTrail.git
+cd packetTrail
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+
+# Usage
+
+Start PacketTrail Sniffer
+Run with thresholds low enough to trigger alerts in a demo:
+
+sudo python3 packettrail.py --iface en0 --window 10 --port-threshold 5 --rate-threshold 30 --beacon-count 5 --beacon-jitter 0.35
+
+# Run the Dashboard
+
+Start the Flask app to view alerts and packets:
+
+python3 app.py --db packettrail.db
+
+Then open http://127.0.0.1:5000 in your browser.
+/alerts shows logged anomalies
+/packets shows captured packet metadata
+
+# Exporting CSVs
+
+python3 export_csv.py --db packettrail.db --out export
+
+This will produce export/packets.csv and export/alerts.csv
+
+# Roadmap
+
+Add filtering and search features to the dashboard
+Implement charts/visualizations of packet volume and alert frequency
+Expand anomaly detection with more rule types
+
+# License
+
+This project is licensed under the MIT License. See LICENSE for details.
+
+
+
+===== ./requirements.txt =====
+scapy==2.5.0
+flask==3.0.3
+
+
+
+===== ./resolve_dns.py =====
+#!/usr/bin/env python3
+import sqlite3, sys, socket, time
+from typing import Optional
+
+DB = sys.argv[1] if len(sys.argv) > 1 else "packettrail.db"
+TIMEOUT = 2.0
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dns_cache (
+          ip TEXT PRIMARY KEY,
+          hostname TEXT,
+          ts_iso TEXT NOT NULL
+        )
+    """)
+    # convenience index if you want lookups by hostname later
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dns_hostname ON dns_cache(hostname)")
+
+def resolve(ip: str) -> Optional[str]:
+    try:
+        socket.setdefaulttimeout(TIMEOUT)
+        host, _aliases, _ips = socket.gethostbyaddr(ip)
+        return host
+    except Exception:
+        return None
+
+def main() -> None:
+    conn = sqlite3.connect(DB)
+    ensure_schema(conn)
+    cur = conn.cursor()
+
+    # Pull distinct dst IPs we’ve seen but don’t have in cache yet
+    rows = cur.execute("""
+        SELECT DISTINCT p.dst_ip
+        FROM packets p
+        LEFT JOIN dns_cache d ON d.ip = p.dst_ip
+        WHERE p.dst_ip IS NOT NULL AND d.ip IS NULL
+        LIMIT 500
+    """).fetchall()
+
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    added = 0
+    for (ip,) in rows:
+        host = resolve(ip)
+        cur.execute(
+            "INSERT OR REPLACE INTO dns_cache(ip, hostname, ts_iso) VALUES (?,?,?)",
+            (ip, host, now_iso)
+        )
+        added += 1
+
+    conn.commit()
+    conn.close()
+    print(f"[dns] cached {added} hostnames")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== ./schema.sql =====
+-- PacketTrail DB schema
+CREATE TABLE IF NOT EXISTS packets (
+  id INTEGER PRIMARY KEY,
+  epoch REAL NOT NULL,
+  ts_iso TEXT NOT NULL,
+  src_ip TEXT,
+  dst_ip TEXT,
+  proto TEXT,
+  sport INTEGER,
+  dport INTEGER,
+  length INTEGER
+);
+
+-- alerts (existing + used by new THREAT_MATCH alerts)
+CREATE TABLE IF NOT EXISTS alerts (
+  id INTEGER PRIMARY KEY,
+  epoch REAL NOT NULL,
+  ts_iso TEXT NOT NULL,
+  src_ip TEXT,
+  alert_type TEXT,
+  details TEXT
+);
+
+-- NEW: threat intel IPs from open feeds (one row per IP)
+CREATE TABLE IF NOT EXISTS threat_intel (
+  ip TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  added_ts TEXT NOT NULL
+);
+
+-- NEW: passive DNS cache for packet IPs (resolved hostnames)
+CREATE TABLE IF NOT EXISTS dns_cache (
+  ip TEXT PRIMARY KEY,
+  hostname TEXT,
+  last_resolved_ts TEXT
+);
+
+
+
+===== ./static/style.css =====
+:root{
+  --pt-blue:#2563eb; /* blue-600 */
+  --pt-red:#dc2626;  /* red-600 */
+  --pt-bg:#0f172a;   /* slate-900 */
+  --pt-card:#111827; /* gray-900 */
+}
+.pt-bg{ background: linear-gradient(180deg, #0b1225 0%, #0f172a 100%); min-height:100vh; }
+.pt-navbar{ background: linear-gradient(90deg, var(--pt-blue), #0ea5e9); }
+.pt-card{ background: linear-gradient(90deg, rgba(37,99,235,.35), rgba(220,38,38,.35)); border:0; }
+.pt-metric{
+  min-width: 160px; padding: 10px 14px; border-radius: 12px; text-align:center;
+  box-shadow: 0 4px 14px rgba(0,0,0,.2);
+}
+.pt-metric .label{ font-size: .8rem; opacity: .85; }
+.pt-metric .value{ font-size: 1.4rem; font-weight: 700; }
+.bg-blue{ background: var(--pt-blue) !important; }
+.bg-red{ background: var(--pt-red) !important; }
+.card{ border:0; }
+.table thead th{ background:#0b1225; color:#cbd5e1; border-bottom:1px solid #233047;}
+.table tbody td{ color:#A9A9A9; border-color:#1f2937;}
+.form-label{ color:#cbd5e1; }
+.form-control, .form-select{ background:#0b1225; color:#A9A9A9; border-color:#1f2937; }
+.btn-primary{ background: var(--pt-blue); border-color: var(--pt-blue); }
+.btn-outline-light{ border-color:#9ca3af; color:#A9A9A9; }
+.summary-blue {
+  color: #60a5fa; /* light blue for summary numbers */
+}
+
+
+
+===== ./templates/alerts.html =====
+{% extends "layout.html" %}
+{% block content %}
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <h1 class="h5 mb-3">Alerts</h1>
+    <form class="row g-2 mb-3" method="get">
+      <div class="col-md-3">
+        <label class="form-label">Start (UTC)</label>
+        <input type="datetime-local" class="form-control" name="start" value="{{ start_val.strftime('%Y-%m-%dT%H:%M') }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">End (UTC)</label>
+        <input type="datetime-local" class="form-control" name="end" value="{{ end_val.strftime('%Y-%m-%dT%H:%M') }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Sort</label>
+        <select class="form-select" name="sort">
+          <option value="desc" {% if sort=='desc' %}selected{% endif %}>Newest first</option>
+          <option value="asc"  {% if sort=='asc'  %}selected{% endif %}>Oldest first</option>
+        </select>
+      </div>
+      <div class="col-md-3 d-flex align-items-end">
+        <button class="btn btn-primary w-100" type="submit">Apply</button>
+      </div>
+    </form>
+
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Source IP</th>
+            <th>Type</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r.ts_iso }}</td>
+            <td><code>{{ r.src_ip or '—' }}</code></td>
+            <td>
+              {% if r.alert_type == 'THREAT_MATCH' %}
+                <span class="badge bg-danger">{{ r.alert_type }}</span>
+              {% elif r.alert_type == 'PORT_SCAN' %}
+                <span class="badge bg-warning text-dark">{{ r.alert_type }}</span>
+              {% elif r.alert_type == 'BEACONING' %}
+                <span class="badge bg-info text-dark">{{ r.alert_type }}</span>
+              {% else %}
+                <span class="badge bg-secondary">{{ r.alert_type }}</span>
+              {% endif %}
+            </td>
+            <td>{{ r.details }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+
+
+===== ./templates/home.html =====
+{% extends "layout.html" %}
+{% block content %}
+
+<div class="row g-3 mb-3">
+  <div class="col-12">
+    <div class="card shadow-sm pt-card">
+      <div class="card-body d-flex flex-wrap justify-content-between align-items-center">
+        <div>
+          <h1 class="h4 mb-1 text-white">Network Overview</h1>
+          <div class="text-white-50">Window: <code id="win-start">{{ start_iso }}</code> → <code id="win-end">{{ end_iso }}</code></div>
+        </div>
+        <div class="d-flex gap-3 mt-3 mt-md-0">
+          <div class="pt-metric bg-blue text-white"><div class="label">Good Traffic</div><div class="value" id="metric-good">{{ good_packets }}</div></div>
+          <div class="pt-metric bg-red text-white"><div class="label">Pending Warnings</div><div class="value" id="metric-alerts">{{ total_alerts }}</div></div>
+          <div class="pt-metric bg-dark text-white"><div class="label">Flagged Hosts</div><div class="value" id="metric-hosts">{{ hosts_flagged }}</div></div>
+          <div class="pt-metric bg-secondary text-white"><div class="label">Packets Seen</div><div class="value" id="metric-total">{{ total_packets }}</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-7">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Traffic Volume (packets / minute)</h2>
+        <canvas id="pktsChart"></canvas>
+      </div>
+    </div>
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Protocol Breakdown</h2>
+        <canvas id="protoChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Alert Frequency (by type)</h2>
+        <canvas id="alertsChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Summary Section (hard-coded blue) -->
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2" style="color:#60a5fa;">Summary</h2>
+        <div class="row">
+          <div class="col-6">
+            <div class="mb-1" style="color:#93c5fd;">Threat Matches (window)</div>
+            <div class="h4" style="color:#60a5fa;" id="metric-threats">{{ threat_hits }}</div>
+          </div>
+          <div class="col-6">
+            <div class="mb-1" style="color:#93c5fd;">Top Talkers</div>
+            <ul class="mb-0" id="top-talkers" style="color:#93c5fd;">
+              {% for t in top_src %}
+              <li><code style="color:#60a5fa;">{{ t.src_ip }}</code> – {{ t.c }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Alerts Section (hard-coded blue; JS respects these colors) -->
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2" style="color:#60a5fa;">Recent Alerts</h2>
+        <ul class="mb-0" id="recent-alerts">
+          {% for a in recent_alerts %}
+            <li class="mb-1">
+              <span class="badge {% if a.alert_type == 'THREAT_MATCH' %}bg-danger{% elif a.alert_type == 'PORT_SCAN' %}bg-warning text-dark{% elif a.alert_type == 'BEACONING' %}bg-info text-dark{% else %}bg-secondary{% endif %}">
+                {{ a.alert_type }}
+              </span>
+              <span class="ms-1" style="color:#93c5fd;">{{ a.ts_iso }}</span>
+              <span class="ms-1"><code style="color:#60a5fa;">{{ a.src_ip or '—' }}</code></span>
+              <span class="ms-1" style="color:#93c5fd;">– {{ a.details }}</span>
+            </li>
+          {% else %}
+            <li style="color:#93c5fd;">No alerts yet in this window.</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+let pktChart, alertChart, protoChart;
+const initPktLabels = {{ packet_labels|tojson }};
+const initPktCounts = {{ packet_counts|tojson }};
+const initAlertTypes = {{ alert_types|tojson }};
+const initAlertValues = {{ alert_values|tojson }};
+const initProtoLabels = {{ proto_labels|tojson }};
+const initProtoValues = {{ proto_values|tojson }};
+
+function buildCharts() {
+  pktChart = new Chart(document.getElementById('pktsChart'), {
+    type:'line',
+    data:{labels:initPktLabels,datasets:[{label:'Packets/min',data:initPktCounts,tension:.2}]},
+    options:{plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8}}}}
+  });
+  alertChart = new Chart(document.getElementById('alertsChart'), {
+    type:'bar',
+    data:{labels:initAlertTypes,datasets:[{label:'Alerts',data:initAlertValues}]},
+    options:{plugins:{legend:{display:false}}}
+  });
+  protoChart = new Chart(document.getElementById('protoChart'), {
+    type:'doughnut',
+    data:{labels:initProtoLabels,datasets:[{data:initProtoValues}]},
+    options:{plugins:{legend:{position:'bottom'}}}
+  });
+}
+
+function htmlEscape(s){return s.replace(/[&<>"]/g,c=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));}
+
+async function refreshOverview(){
+  try{
+    const res = await fetch('/api/overview'); const j = await res.json();
+    document.getElementById('metric-good').textContent   = j.good_packets;
+    document.getElementById('metric-alerts').textContent = j.total_alerts;
+    document.getElementById('metric-hosts').textContent  = j.hosts_flagged;
+    document.getElementById('metric-total').textContent  = j.total_packets;
+    document.getElementById('win-start').textContent     = j.start_iso;
+    document.getElementById('win-end').textContent       = j.end_iso;
+    document.getElementById('metric-threats').textContent= j.threat_hits;
+
+    // charts
+    pktChart.data.labels = j.packet_labels; pktChart.data.datasets[0].data = j.packet_counts; pktChart.update('none');
+    alertChart.data.labels = j.alert_types; alertChart.data.datasets[0].data = j.alert_values; alertChart.update('none');
+    protoChart.data.labels = j.proto_labels; protoChart.data.datasets[0].data = j.proto_values; protoChart.update('none');
+
+    // top talkers (blue)
+    const tt = document.getElementById('top-talkers');
+    tt.innerHTML = '';
+    (j.top_src || []).forEach(t=>{
+      const li = document.createElement('li');
+      li.style.color = '#93c5fd';
+      li.innerHTML = `<code style="color:#60a5fa;">${htmlEscape(t.src_ip)}</code> – ${htmlEscape(String(t.c))}`;
+      tt.appendChild(li);
+    });
+
+    // recent alerts (all blue tones, no white classes)
+    const ul = document.getElementById('recent-alerts');
+    ul.innerHTML = '';
+    if ((j.recent_alerts || []).length === 0){
+      const li = document.createElement('li');
+      li.style.color = '#93c5fd';
+      li.textContent = 'No alerts yet in this window.';
+      ul.appendChild(li);
+    } else {
+      j.recent_alerts.forEach(a=>{
+        const li = document.createElement('li');
+        li.className = 'mb-1';
+        const badgeClass = a.alert_type === 'THREAT_MATCH' ? 'bg-danger'
+          : a.alert_type === 'PORT_SCAN' ? 'bg-warning text-dark'
+          : a.alert_type === 'BEACONING' ? 'bg-info text-dark' : 'bg-secondary';
+
+        li.innerHTML =
+          `<span class="badge ${badgeClass}">${htmlEscape(a.alert_type)}</span>
+           <span class="ms-1" style="color:#93c5fd;">${htmlEscape(a.ts_iso)}</span>
+           <span class="ms-1"><code style="color:#60a5fa;">${htmlEscape(a.src_ip || '—')}</code></span>
+           <span class="ms-1" style="color:#93c5fd;">– ${htmlEscape(a.details || '')}</span>`;
+        ul.appendChild(li);
+      });
+    }
+  }catch(e){}
+}
+
+buildCharts();
+setInterval(refreshOverview, 10000);
+</script>
+
+{% endblock %}
+
+
+
+===== ./templates/layout.html =====
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PacketTrail</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="/static/style.css" rel="stylesheet">
+</head>
+<body class="pt-bg">
+<nav class="navbar navbar-expand-lg pt-navbar mb-4">
+  <div class="container">
+    <a class="navbar-brand fw-bold text-white" href="/">PacketTrail</a>
+    <div class="navbar-nav">
+      <a class="nav-link text-white-50" href="/">Dashboard</a>
+      <a class="nav-link text-white-50" href="/alerts">Alerts</a>
+      <a class="nav-link text-white-50" href="/packets">Packets</a>
+    </div>
+  </div>
+</nav>
+<main class="container">
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
+
+
+
+===== ./templates/packets.html =====
+{% extends "layout.html" %}
+{% block content %}
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <h1 class="h5 mb-3">Packets</h1>
+    <form class="row g-2 mb-3" method="get">
+      <div class="col-md-3">
+        <label class="form-label">Start (UTC)</label>
+        <input type="datetime-local" class="form-control" name="start" value="{{ start_val.strftime('%Y-%m-%dT%H:%M') }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">End (UTC)</label>
+        <input type="datetime-local" class="form-control" name="end" value="{{ end_val.strftime('%Y-%m-%dT%H:%M') }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Sort</label>
+        <select class="form-select" name="sort">
+          <option value="desc" {% if sort=='desc' %}selected{% endif %}>Newest first</option>
+          <option value="asc"  {% if sort=='asc'  %}selected{% endif %}>Oldest first</option>
+        </select>
+      </div>
+      <div class="col-md-3 d-flex align-items-end">
+        <button class="btn btn-primary w-100" type="submit">Apply</button>
+      </div>
+    </form>
+
+    <div class="text-white-50 mb-2">Tip: run <code>python3 resolve_dns.py --db packettrail.db</code> to populate hostnames.</div>
+
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Src IP</th>
+            <th>Dst IP</th>
+            <th>Website/Hostname</th>
+            <th>Proto</th>
+            <th>Sport</th>
+            <th>Dport</th>
+            <th>Len</th>
+            <th>Freq (1h)</th>
+            <th>Threat</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r.ts_iso }}</td>
+            <td><code>{{ r.src_ip }}</code></td>
+            <td><code>{{ r.dst_ip }}</code></td>
+            <td>{{ r.dst_host or '—' }}</td>
+            <td>{{ r.proto }}</td>
+            <td>{{ r.sport or '—' }}</td>
+            <td>{{ r.dport or '—' }}</td>
+            <td>{{ r.length }}</td>
+            <td>{{ r.freq_last_hour }}</td>
+            <td>
+              {% if r.is_threat %}
+              <span class="badge bg-danger">Match</span>
+              {% else %}
+              <span class="badge bg-secondary">None</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+
+
+===== ./update_threats.py =====
+#!/usr/bin/env python3
+import sqlite3, sys, time, urllib.request, urllib.error
+
+FEEDS = [
+    ("https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset", "firehol_level1"),
+    # This one sometimes goes 404; we'll try and skip on failure:
+    ("https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/malwaredomainlist.ipset", "malwaredomainlist"),
+    ("https://www.spamhaus.org/drop/drop.txt", "spamhaus_drop"),
+    ("https://www.spamhaus.org/drop/edrop.txt", "spamhaus_edrop"),
+    ("https://rules.emergingthreats.net/blockrules/compromised-ips.txt", "emergingthreats_compromised"),
+]
+
+def fetch_lines(url: str):
+    with urllib.request.urlopen(url, timeout=45) as r:
+        for raw in r.read().decode("utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            token = line.split()[0]  # handle "IP ; comment"
+            yield token
+
+def main(db_path: str):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS threat_intel (
+          ip TEXT PRIMARY KEY,
+          source TEXT NOT NULL,
+          added_ts TEXT NOT NULL
+        )
+    """)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    total = 0
+
+    for url, src in FEEDS:
+        try:
+            ips = set()
+            for token in fetch_lines(url):
+                # skip IPv6 for now (simple MVP)
+                if ":" in token:
+                    continue
+                # keep CIDR/networks as-is so you can still see the item
+                ips.add(token)
+            if not ips:
+                print(f"[threats] {src}: 0 items (empty)")
+                continue
+            rows = [(ip, src, now_iso) for ip in ips]
+            cur.executemany(
+                "INSERT OR REPLACE INTO threat_intel(ip, source, added_ts) VALUES (?,?,?)",
+                rows
+            )
+            conn.commit()
+            print(f"[threats] {src}: {len(rows)} items")
+            total += len(rows)
+        except urllib.error.HTTPError as e:
+            print(f"[threats] {src}: HTTP {e.code} ({url}) — skipped")
+        except Exception as e:
+            print(f"[threats] {src}: error {e} — skipped")
+
+    conn.close()
+    print(f"[threats] total stored: {total}")
+
+if __name__ == "__main__":
+    db = sys.argv[1] if len(sys.argv) > 1 else "packettrail.db"
+    main(db)
+
+
+

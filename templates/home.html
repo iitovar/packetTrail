@@ -10,22 +10,10 @@
           <div class="text-white-50">Window: <code id="win-start">{{ start_iso }}</code> → <code id="win-end">{{ end_iso }}</code></div>
         </div>
         <div class="d-flex gap-3 mt-3 mt-md-0">
-          <div class="pt-metric bg-blue text-white">
-            <div class="label">Good Traffic</div>
-            <div class="value" id="metric-good">{{ good_packets }}</div>
-          </div>
-          <div class="pt-metric bg-red text-white">
-            <div class="label">Pending Warnings</div>
-            <div class="value" id="metric-alerts">{{ total_alerts }}</div>
-          </div>
-          <div class="pt-metric bg-dark text-white">
-            <div class="label">Flagged Hosts</div>
-            <div class="value" id="metric-hosts">{{ hosts_flagged }}</div>
-          </div>
-          <div class="pt-metric bg-secondary text-white">
-            <div class="label">Packets Seen</div>
-            <div class="value" id="metric-total">{{ total_packets }}</div>
-          </div>
+          <div class="pt-metric bg-blue text-white"><div class="label">Good Traffic</div><div class="value" id="metric-good">{{ good_packets }}</div></div>
+          <div class="pt-metric bg-red text-white"><div class="label">Pending Warnings</div><div class="value" id="metric-alerts">{{ total_alerts }}</div></div>
+          <div class="pt-metric bg-dark text-white"><div class="label">Flagged Hosts</div><div class="value" id="metric-hosts">{{ hosts_flagged }}</div></div>
+          <div class="pt-metric bg-secondary text-white"><div class="label">Packets Seen</div><div class="value" id="metric-total">{{ total_packets }}</div></div>
         </div>
       </div>
     </div>
@@ -34,18 +22,10 @@
 
 <div class="row g-3">
   <div class="col-lg-7">
-    <div class="card shadow-sm">
+    <div class="card shadow-sm mb-3">
       <div class="card-body">
         <h2 class="h6 mb-2">Traffic Volume (packets / minute)</h2>
         <canvas id="pktsChart"></canvas>
-      </div>
-    </div>
-  </div>
-  <div class="col-lg-5">
-    <div class="card shadow-sm mb-3">
-      <div class="card-body">
-        <h2 class="h6 mb-2">Alert Frequency (by type)</h2>
-        <canvas id="alertsChart"></canvas>
       </div>
     </div>
     <div class="card shadow-sm">
@@ -55,13 +35,63 @@
       </div>
     </div>
   </div>
+
+  <div class="col-lg-5">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <h2 class="h6 mb-2">Alert Frequency (by type)</h2>
+        <canvas id="alertsChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Summary Section (hard-coded blue) -->
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2" style="color:#60a5fa;">Summary</h2>
+        <div class="row">
+          <div class="col-6">
+            <div class="mb-1" style="color:#93c5fd;">Threat Matches (window)</div>
+            <div class="h4" style="color:#60a5fa;" id="metric-threats">{{ threat_hits }}</div>
+          </div>
+          <div class="col-6">
+            <div class="mb-1" style="color:#93c5fd;">Top Talkers</div>
+            <ul class="mb-0" id="top-talkers" style="color:#93c5fd;">
+              {% for t in top_src %}
+              <li><code style="color:#60a5fa;">{{ t.src_ip }}</code> – {{ t.c }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Alerts Section (hard-coded blue; JS respects these colors) -->
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h6 mb-2" style="color:#60a5fa;">Recent Alerts</h2>
+        <ul class="mb-0" id="recent-alerts">
+          {% for a in recent_alerts %}
+            <li class="mb-1">
+              <span class="badge {% if a.alert_type == 'THREAT_MATCH' %}bg-danger{% elif a.alert_type == 'PORT_SCAN' %}bg-warning text-dark{% elif a.alert_type == 'BEACONING' %}bg-info text-dark{% else %}bg-secondary{% endif %}">
+                {{ a.alert_type }}
+              </span>
+              <span class="ms-1" style="color:#93c5fd;">{{ a.ts_iso }}</span>
+              <span class="ms-1"><code style="color:#60a5fa;">{{ a.src_ip or '—' }}</code></span>
+              <span class="ms-1" style="color:#93c5fd;">– {{ a.details }}</span>
+            </li>
+          {% else %}
+            <li style="color:#93c5fd;">No alerts yet in this window.</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
 let pktChart, alertChart, protoChart;
-
-// initial data from server render
 const initPktLabels = {{ packet_labels|tojson }};
 const initPktCounts = {{ packet_counts|tojson }};
 const initAlertTypes = {{ alert_types|tojson }};
@@ -70,61 +100,81 @@ const initProtoLabels = {{ proto_labels|tojson }};
 const initProtoValues = {{ proto_values|tojson }};
 
 function buildCharts() {
-  const pktCtx = document.getElementById('pktsChart');
-  const alertsCtx = document.getElementById('alertsChart');
-  const protoCtx = document.getElementById('protoChart');
-
-  pktChart = new Chart(pktCtx, {
-    type: 'line',
-    data: { labels: initPktLabels, datasets: [{ label: 'Packets/min', data: initPktCounts, tension: 0.2 }]},
-    options: { plugins:{legend:{display:false}}, scales: { x: { ticks: { maxTicksLimit: 8 }}}}
+  pktChart = new Chart(document.getElementById('pktsChart'), {
+    type:'line',
+    data:{labels:initPktLabels,datasets:[{label:'Packets/min',data:initPktCounts,tension:.2}]},
+    options:{plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8}}}}
   });
-
-  alertChart = new Chart(alertsCtx, {
-    type: 'bar',
-    data: { labels: initAlertTypes, datasets: [{ label: 'Alerts', data: initAlertValues }]},
-    options: { plugins: { legend: { display: false }}}
+  alertChart = new Chart(document.getElementById('alertsChart'), {
+    type:'bar',
+    data:{labels:initAlertTypes,datasets:[{label:'Alerts',data:initAlertValues}]},
+    options:{plugins:{legend:{display:false}}}
   });
-
-  protoChart = new Chart(protoCtx, {
-    type: 'doughnut',
-    data: { labels: initProtoLabels, datasets: [{ data: initProtoValues }]},
-    options: { plugins: { legend: { position: 'bottom' }}}
+  protoChart = new Chart(document.getElementById('protoChart'), {
+    type:'doughnut',
+    data:{labels:initProtoLabels,datasets:[{data:initProtoValues}]},
+    options:{plugins:{legend:{position:'bottom'}}}
   });
 }
 
-async function refreshOverview() {
-  try {
-    const res = await fetch('/api/overview');
-    const j = await res.json();
+function htmlEscape(s){return s.replace(/[&<>"]/g,c=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));}
 
-    // metrics
-    document.getElementById('metric-good').textContent = j.good_packets;
+async function refreshOverview(){
+  try{
+    const res = await fetch('/api/overview'); const j = await res.json();
+    document.getElementById('metric-good').textContent   = j.good_packets;
     document.getElementById('metric-alerts').textContent = j.total_alerts;
-    document.getElementById('metric-hosts').textContent = j.hosts_flagged;
-    document.getElementById('metric-total').textContent = j.total_packets;
-    document.getElementById('win-start').textContent = j.start_iso;
-    document.getElementById('win-end').textContent = j.end_iso;
+    document.getElementById('metric-hosts').textContent  = j.hosts_flagged;
+    document.getElementById('metric-total').textContent  = j.total_packets;
+    document.getElementById('win-start').textContent     = j.start_iso;
+    document.getElementById('win-end').textContent       = j.end_iso;
+    document.getElementById('metric-threats').textContent= j.threat_hits;
 
     // charts
-    pktChart.data.labels = j.packet_labels;
-    pktChart.data.datasets[0].data = j.packet_counts;
-    pktChart.update('none');
+    pktChart.data.labels = j.packet_labels; pktChart.data.datasets[0].data = j.packet_counts; pktChart.update('none');
+    alertChart.data.labels = j.alert_types; alertChart.data.datasets[0].data = j.alert_values; alertChart.update('none');
+    protoChart.data.labels = j.proto_labels; protoChart.data.datasets[0].data = j.proto_values; protoChart.update('none');
 
-    alertChart.data.labels = j.alert_types;
-    alertChart.data.datasets[0].data = j.alert_values;
-    alertChart.update('none');
+    // top talkers (blue)
+    const tt = document.getElementById('top-talkers');
+    tt.innerHTML = '';
+    (j.top_src || []).forEach(t=>{
+      const li = document.createElement('li');
+      li.style.color = '#93c5fd';
+      li.innerHTML = `<code style="color:#60a5fa;">${htmlEscape(t.src_ip)}</code> – ${htmlEscape(String(t.c))}`;
+      tt.appendChild(li);
+    });
 
-    protoChart.data.labels = j.proto_labels;
-    protoChart.data.datasets[0].data = j.proto_values;
-    protoChart.update('none');
-  } catch (e) {
-    // ignore transient errors during demo
-  }
+    // recent alerts (all blue tones, no white classes)
+    const ul = document.getElementById('recent-alerts');
+    ul.innerHTML = '';
+    if ((j.recent_alerts || []).length === 0){
+      const li = document.createElement('li');
+      li.style.color = '#93c5fd';
+      li.textContent = 'No alerts yet in this window.';
+      ul.appendChild(li);
+    } else {
+      j.recent_alerts.forEach(a=>{
+        const li = document.createElement('li');
+        li.className = 'mb-1';
+        const badgeClass = a.alert_type === 'THREAT_MATCH' ? 'bg-danger'
+          : a.alert_type === 'PORT_SCAN' ? 'bg-warning text-dark'
+          : a.alert_type === 'BEACONING' ? 'bg-info text-dark' : 'bg-secondary';
+
+        li.innerHTML =
+          `<span class="badge ${badgeClass}">${htmlEscape(a.alert_type)}</span>
+           <span class="ms-1" style="color:#93c5fd;">${htmlEscape(a.ts_iso)}</span>
+           <span class="ms-1"><code style="color:#60a5fa;">${htmlEscape(a.src_ip || '—')}</code></span>
+           <span class="ms-1" style="color:#93c5fd;">– ${htmlEscape(a.details || '')}</span>`;
+        ul.appendChild(li);
+      });
+    }
+  }catch(e){}
 }
 
 buildCharts();
-setInterval(refreshOverview, 10000); // refresh every 10 seconds
+setInterval(refreshOverview, 10000);
 </script>
+
 {% endblock %}
 

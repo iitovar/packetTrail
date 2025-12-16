@@ -1,63 +1,72 @@
 {% extends "layout.html" %}
 {% block content %}
-<h1 class="h5 mb-3 text-white">Packets</h1>
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <h1 class="h5 mb-3">Packets</h1>
+    <form class="row g-2 mb-3" method="get">
+      <div class="col-md-3">
+        <label class="form-label">Start (UTC)</label>
+        <input type="datetime-local" class="form-control" name="start" value="{{ start_val.strftime('%Y-%m-%dT%H:%M') }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">End (UTC)</label>
+        <input type="datetime-local" class="form-control" name="end" value="{{ end_val.strftime('%Y-%m-%dT%H:%M') }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Sort</label>
+        <select class="form-select" name="sort">
+          <option value="desc" {% if sort=='desc' %}selected{% endif %}>Newest first</option>
+          <option value="asc"  {% if sort=='asc'  %}selected{% endif %}>Oldest first</option>
+        </select>
+      </div>
+      <div class="col-md-3 d-flex align-items-end">
+        <button class="btn btn-primary w-100" type="submit">Apply</button>
+      </div>
+    </form>
 
-<form class="row gy-2 gx-2 align-items-end mb-3" method="get">
-  <div class="col-md-3">
-    <label class="form-label text-white-50">Src contains</label>
-    <input name="qsrc" class="form-control" value="{{ qsrc or '' }}" placeholder="e.g., 192.168.1.77">
-  </div>
-  <div class="col-md-3">
-    <label class="form-label text-white-50">Dst contains</label>
-    <input name="qdst" class="form-control" value="{{ qdst or '' }}" placeholder="e.g., 224.0.0.251">
-  </div>
-  <div class="col-md-2">
-    <label class="form-label text-white-50">Protocol</label>
-    <select name="proto" class="form-select">
-      <option value=""  {{ ''  == proto and 'selected' or '' }}>Any</option>
-      <option value="TCP" {{ 'TCP' == proto and 'selected' or '' }}>TCP</option>
-      <option value="UDP" {{ 'UDP' == proto and 'selected' or '' }}>UDP</option>
-    </select>
-  </div>
-  <div class="col-md-2">
-    <label class="form-label text-white-50">Start (UTC date)</label>
-    <input name="start" type="date" class="form-control" value="{{ start_val }}">
-  </div>
-  <div class="col-md-2">
-    <label class="form-label text-white-50">End (UTC date)</label>
-    <input name="end" type="date" class="form-control" value="{{ end_val }}">
-  </div>
-  <div class="col-12 col-md-2">
-    <label class="form-label d-block text-white-50">&nbsp;</label>
-    <button class="btn btn-primary w-100" type="submit">Apply</button>
-  </div>
-</form>
+    <div class="text-white-50 mb-2">Tip: run <code>python3 resolve_dns.py --db packettrail.db</code> to populate hostnames.</div>
 
-<div class="card shadow-sm">
-<div class="table-responsive">
-<table class="table table-sm table-striped mb-0">
-  <thead>
-    <tr><th>Time (UTC)</th><th>Src</th><th>Dst</th><th>Proto</th><th>S</th><th>D</th><th>Len</th></tr>
-  </thead>
-  <tbody>
-    {% for r in rows %}
-    <tr>
-      <td>{{ r.ts_iso }}</td>
-      <td>{{ r.src_ip }}</td>
-      <td>{{ r.dst_ip }}</td>
-      <td>{{ r.proto }}</td>
-      <td>{{ r.sport }}</td>
-      <td>{{ r.dport }}</td>
-      <td>{{ r.length }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle">
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Src IP</th>
+            <th>Dst IP</th>
+            <th>Website/Hostname</th>
+            <th>Proto</th>
+            <th>Sport</th>
+            <th>Dport</th>
+            <th>Len</th>
+            <th>Freq (1h)</th>
+            <th>Threat</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r.ts_iso }}</td>
+            <td><code>{{ r.src_ip }}</code></td>
+            <td><code>{{ r.dst_ip }}</code></td>
+            <td>{{ r.dst_host or '—' }}</td>
+            <td>{{ r.proto }}</td>
+            <td>{{ r.sport or '—' }}</td>
+            <td>{{ r.dport or '—' }}</td>
+            <td>{{ r.length }}</td>
+            <td>{{ r.freq_last_hour }}</td>
+            <td>
+              {% if r.is_threat %}
+              <span class="badge bg-danger">Match</span>
+              {% else %}
+              <span class="badge bg-secondary">None</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
 </div>
-</div>
-
-<p class="mt-2 text-white-50">Showing {{ rows|length }} of {{ count }} — page {{ page }}</p>
-<a class="btn btn-outline-light btn-sm" href="?page={{ page-1 if page>1 else 1 }}&size={{ size }}&qsrc={{ qsrc }}&qdst={{ qdst }}&proto={{ proto }}&start={{ start_val }}&end={{ end_val }}">Prev</a>
-<a class="btn btn-outline-light btn-sm" href="?page={{ page+1 }}&size={{ size }}&qsrc={{ qsrc }}&qdst={{ qdst }}&proto={{ proto }}&start={{ start_val }}&end={{ end_val }}">Next</a>
 {% endblock %}
 

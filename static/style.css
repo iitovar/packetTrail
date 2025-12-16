@@ -22,4 +22,7 @@
 .form-control, .form-select{ background:#0b1225; color:#A9A9A9; border-color:#1f2937; }
 .btn-primary{ background: var(--pt-blue); border-color: var(--pt-blue); }
 .btn-outline-light{ border-color:#9ca3af; color:#A9A9A9; }
+.summary-blue {
+  color: #60a5fa; /* light blue for summary numbers */
+}
 

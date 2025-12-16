@@ -1,0 +1,28 @@
+# 1) Start venv
+
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+
+# 2) Start sniffer
+
+sudo .venv/bin/python packettrail.py \
+  --iface en0 \
+  --window 10 \
+  --port-threshold 5 \
+  --rate-threshold 30 \
+  --beacon-count 5 \
+  --beacon-jitter 0.35
+
+# 3) start the dashboard in a new terminal
+
+python3 app.py --db packettrail.db
+
+# 4) (optional) generate some traffic in another terminal
+
+for i in {1..80}; do curl -s https://example.com > /dev/null; done
+
+# 5) open 
+
+http://127.0.0.1:5000/
+
