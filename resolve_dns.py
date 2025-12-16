@@ -13,7 +13,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           ts_iso TEXT NOT NULL
         )
     """)
-    # convenience index if you want lookups by hostname later
+    # convenience index 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dns_hostname ON dns_cache(hostname)")
 
 def resolve(ip: str) -> Optional[str]:
@@ -29,7 +29,7 @@ def main() -> None:
     ensure_schema(conn)
     cur = conn.cursor()
 
-    # Pull distinct dst IPs we’ve seen but don’t have in cache yet
+    # Pull distinct dst IPs 
     rows = cur.execute("""
         SELECT DISTINCT p.dst_ip
         FROM packets p
